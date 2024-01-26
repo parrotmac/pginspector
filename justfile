@@ -25,10 +25,11 @@ gen: db
       --postgres-connection "postgres://postgres:postgres@localhost:54322/postgres" \
       --query-glob models/**/queries*.sql \
       --go-type 'name=string' --go-type 'varchar=*string' --go-type 'int8=int' --go-type 'text=*string' --go-type 'uuid=github.com/google/uuid.UUID' --go-type 'timestamp=*time.Time' --go-type 'timestampz=*time.Time' --go-type 'jsonb=[]byte'
-    go run .
+    mkdir -p generated_models
+    go run . -output generated_models/generated_queries.sql
     pggen gen go \
       --postgres-connection "postgres://postgres:postgres@localhost:54322/postgres" \
-      --query-glob validation/**/generated_queries.sql \
+      --query-glob generated_models/**/generated_queries.sql \
       --go-type 'name=string' --go-type 'varchar=*string' --go-type 'int8=int' --go-type 'text=*string' --go-type 'uuid=github.com/google/uuid.UUID' --go-type 'timestamp=*time.Time' --go-type 'timestampz=*time.Time' --go-type 'jsonb=[]byte'
     goimports -w models/*.sql.go
-    goimports -w validation/*.sql.go
+    goimports -w generated_models/*.sql.go

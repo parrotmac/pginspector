@@ -10,5 +10,4 @@ FROM
     information_schema.columns
 WHERE
     table_schema = pggen.arg('schema_name')
-    AND table_name <> ANY (pggen.arg('exclude_tables'))
 ORDER BY column_name;

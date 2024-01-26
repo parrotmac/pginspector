@@ -22,4 +22,4 @@
 go.work
 
 
-validation/
+generated_models/

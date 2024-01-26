@@ -5,6 +5,7 @@ package models
 import (
 	"context"
 	"fmt"
+
 	"github.com/jackc/pgconn"
 	"github.com/jackc/pgtype"
 	"github.com/jackc/pgx/v4"
@@ -16,10 +17,10 @@ import (
 // calling SendBatch on pgx.Conn, pgxpool.Pool, or pgx.Tx, use the Scan methods
 // to parse the results.
 type Querier interface {
-	ListTableColumnsInSchema(ctx context.Context, schemaName string, excludeTables []string) ([]ListTableColumnsInSchemaRow, error)
+	ListTableColumnsInSchema(ctx context.Context, schemaName string) ([]ListTableColumnsInSchemaRow, error)
 	// ListTableColumnsInSchemaBatch enqueues a ListTableColumnsInSchema query into batch to be executed
 	// later by the batch.
-	ListTableColumnsInSchemaBatch(batch genericBatch, schemaName string, excludeTables []string)
+	ListTableColumnsInSchemaBatch(batch genericBatch, schemaName string)
 	// ListTableColumnsInSchemaScan scans the result of an executed ListTableColumnsInSchemaBatch query.
 	ListTableColumnsInSchemaScan(results pgx.BatchResults) ([]ListTableColumnsInSchemaRow, error)
 }
@@ -150,7 +151,6 @@ FROM
     information_schema.columns
 WHERE
     table_schema = $1
-    AND table_name <> ANY ($2)
 ORDER BY column_name;`
 
 type ListTableColumnsInSchemaRow struct {
@@ -162,9 +162,9 @@ type ListTableColumnsInSchemaRow struct {
 }
 
 // ListTableColumnsInSchema implements Querier.ListTableColumnsInSchema.
-func (q *DBQuerier) ListTableColumnsInSchema(ctx context.Context, schemaName string, excludeTables []string) ([]ListTableColumnsInSchemaRow, error) {
+func (q *DBQuerier) ListTableColumnsInSchema(ctx context.Context, schemaName string) ([]ListTableColumnsInSchemaRow, error) {
 	ctx = context.WithValue(ctx, "pggen_query_name", "ListTableColumnsInSchema")
-	rows, err := q.conn.Query(ctx, listTableColumnsInSchemaSQL, schemaName, excludeTables)
+	rows, err := q.conn.Query(ctx, listTableColumnsInSchemaSQL, schemaName)
 	if err != nil {
 		return nil, fmt.Errorf("query ListTableColumnsInSchema: %w", err)
 	}
@@ -184,8 +184,8 @@ func (q *DBQuerier) ListTableColumnsInSchema(ctx context.Context, schemaName str
 }
 
 // ListTableColumnsInSchemaBatch implements Querier.ListTableColumnsInSchemaBatch.
-func (q *DBQuerier) ListTableColumnsInSchemaBatch(batch genericBatch, schemaName string, excludeTables []string) {
-	batch.Queue(listTableColumnsInSchemaSQL, schemaName, excludeTables)
+func (q *DBQuerier) ListTableColumnsInSchemaBatch(batch genericBatch, schemaName string) {
+	batch.Queue(listTableColumnsInSchemaSQL, schemaName)
 }
 
 // ListTableColumnsInSchemaScan implements Querier.ListTableColumnsInSchemaScan.
