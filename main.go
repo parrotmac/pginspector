@@ -226,7 +226,7 @@ func main() {
 			},
 		}
 
-		_, err = fmt.Fprintf(os.Stdout, "# And example configuration for the provided database database follows.\n# You may need to edit this to suit your needs.\n\n")
+		_, err = fmt.Fprintf(os.Stdout, "# And example configuration for the provided database follows.\n# You may need to edit this to suit your needs.\n\n")
 		if err != nil {
 			log.Fatalf("Unable to write output to stdout: %v\n", err)
 		}
