@@ -5,15 +5,23 @@ package models
 import (
 	"context"
 	"fmt"
-
 	"github.com/jackc/pgconn"
 	"github.com/jackc/pgtype"
 	"github.com/jackc/pgx/v4"
 )
 
 // Querier is a typesafe Go interface backed by SQL queries.
+//
+// Methods ending with Batch enqueue a query to run later in a pgx.Batch. After
+// calling SendBatch on pgx.Conn, pgxpool.Pool, or pgx.Tx, use the Scan methods
+// to parse the results.
 type Querier interface {
-	ListTableColumnsInSchema(ctx context.Context, schemaName string) ([]ListTableColumnsInSchemaRow, error)
+	ListTableColumnsInSchema(ctx context.Context, schemaName string, excludeTables []string) ([]ListTableColumnsInSchemaRow, error)
+	// ListTableColumnsInSchemaBatch enqueues a ListTableColumnsInSchema query into batch to be executed
+	// later by the batch.
+	ListTableColumnsInSchemaBatch(batch genericBatch, schemaName string, excludeTables []string)
+	// ListTableColumnsInSchemaScan scans the result of an executed ListTableColumnsInSchemaBatch query.
+	ListTableColumnsInSchemaScan(results pgx.BatchResults) ([]ListTableColumnsInSchemaRow, error)
 }
 
 type DBQuerier struct {
@@ -42,10 +50,34 @@ type genericConn interface {
 	Exec(ctx context.Context, sql string, arguments ...interface{}) (pgconn.CommandTag, error)
 }
 
+// genericBatch batches queries to send in a single network request to a
+// Postgres server. This is usually backed by *pgx.Batch.
+type genericBatch interface {
+	// Queue queues a query to batch b. query can be an SQL query or the name of a
+	// prepared statement. See Queue on *pgx.Batch.
+	Queue(query string, arguments ...interface{})
+}
+
 // NewQuerier creates a DBQuerier that implements Querier. conn is typically
 // *pgx.Conn, pgx.Tx, or *pgxpool.Pool.
 func NewQuerier(conn genericConn) *DBQuerier {
-	return &DBQuerier{conn: conn, types: newTypeResolver()}
+	return NewQuerierConfig(conn, QuerierConfig{})
+}
+
+type QuerierConfig struct {
+	// DataTypes contains pgtype.Value to use for encoding and decoding instead
+	// of pggen-generated pgtype.ValueTranscoder.
+	//
+	// If OIDs are available for an input parameter type and all of its
+	// transitive dependencies, pggen will use the binary encoding format for
+	// the input parameter.
+	DataTypes []pgtype.DataType
+}
+
+// NewQuerierConfig creates a DBQuerier that implements Querier with the given
+// config. conn is typically *pgx.Conn, pgx.Tx, or *pgxpool.Pool.
+func NewQuerierConfig(conn genericConn, cfg QuerierConfig) *DBQuerier {
+	return &DBQuerier{conn: conn, types: newTypeResolver(cfg.DataTypes)}
 }
 
 // WithTx creates a new DBQuerier that uses the transaction to run all queries.
@@ -53,13 +85,39 @@ func (q *DBQuerier) WithTx(tx pgx.Tx) (*DBQuerier, error) {
 	return &DBQuerier{conn: tx}, nil
 }
 
+// preparer is any Postgres connection transport that provides a way to prepare
+// a statement, most commonly *pgx.Conn.
+type preparer interface {
+	Prepare(ctx context.Context, name, sql string) (sd *pgconn.StatementDescription, err error)
+}
+
+// PrepareAllQueries executes a PREPARE statement for all pggen generated SQL
+// queries in querier files. Typical usage is as the AfterConnect callback
+// for pgxpool.Config
+//
+// pgx will use the prepared statement if available. Calling PrepareAllQueries
+// is an optional optimization to avoid a network round-trip the first time pgx
+// runs a query if pgx statement caching is enabled.
+func PrepareAllQueries(ctx context.Context, p preparer) error {
+	if _, err := p.Prepare(ctx, listTableColumnsInSchemaSQL, listTableColumnsInSchemaSQL); err != nil {
+		return fmt.Errorf("prepare query 'ListTableColumnsInSchema': %w", err)
+	}
+	return nil
+}
+
 // typeResolver looks up the pgtype.ValueTranscoder by Postgres type name.
 type typeResolver struct {
 	connInfo *pgtype.ConnInfo // types by Postgres type name
 }
 
-func newTypeResolver() *typeResolver {
+func newTypeResolver(types []pgtype.DataType) *typeResolver {
 	ci := pgtype.NewConnInfo()
+	for _, typ := range types {
+		if txt, ok := typ.Value.(textPreferrer); ok && typ.OID != unknownOID {
+			typ.Value = txt.ValueTranscoder
+		}
+		ci.RegisterDataType(typ)
+	}
 	return &typeResolver{connInfo: ci}
 }
 
@@ -82,7 +140,18 @@ func (tr *typeResolver) setValue(vt pgtype.ValueTranscoder, val interface{}) pgt
 	return vt
 }
 
-const listTableColumnsInSchemaSQL = `SELECT column_name, data_type, column_default, is_nullable, table_name FROM information_schema.columns WHERE table_schema = $1 ORDER BY column_name;`
+const listTableColumnsInSchemaSQL = `SELECT
+    column_name,
+    data_type,
+    column_default,
+    is_nullable,
+    table_name
+FROM
+    information_schema.columns
+WHERE
+    table_schema = $1
+    AND table_name <> ANY ($2)
+ORDER BY column_name;`
 
 type ListTableColumnsInSchemaRow struct {
 	ColumnName    string  `json:"column_name"`
@@ -93,9 +162,9 @@ type ListTableColumnsInSchemaRow struct {
 }
 
 // ListTableColumnsInSchema implements Querier.ListTableColumnsInSchema.
-func (q *DBQuerier) ListTableColumnsInSchema(ctx context.Context, schemaName string) ([]ListTableColumnsInSchemaRow, error) {
+func (q *DBQuerier) ListTableColumnsInSchema(ctx context.Context, schemaName string, excludeTables []string) ([]ListTableColumnsInSchemaRow, error) {
 	ctx = context.WithValue(ctx, "pggen_query_name", "ListTableColumnsInSchema")
-	rows, err := q.conn.Query(ctx, listTableColumnsInSchemaSQL, schemaName)
+	rows, err := q.conn.Query(ctx, listTableColumnsInSchemaSQL, schemaName, excludeTables)
 	if err != nil {
 		return nil, fmt.Errorf("query ListTableColumnsInSchema: %w", err)
 	}
@@ -110,6 +179,32 @@ func (q *DBQuerier) ListTableColumnsInSchema(ctx context.Context, schemaName str
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("close ListTableColumnsInSchema rows: %w", err)
+	}
+	return items, err
+}
+
+// ListTableColumnsInSchemaBatch implements Querier.ListTableColumnsInSchemaBatch.
+func (q *DBQuerier) ListTableColumnsInSchemaBatch(batch genericBatch, schemaName string, excludeTables []string) {
+	batch.Queue(listTableColumnsInSchemaSQL, schemaName, excludeTables)
+}
+
+// ListTableColumnsInSchemaScan implements Querier.ListTableColumnsInSchemaScan.
+func (q *DBQuerier) ListTableColumnsInSchemaScan(results pgx.BatchResults) ([]ListTableColumnsInSchemaRow, error) {
+	rows, err := results.Query()
+	if err != nil {
+		return nil, fmt.Errorf("query ListTableColumnsInSchemaBatch: %w", err)
+	}
+	defer rows.Close()
+	items := []ListTableColumnsInSchemaRow{}
+	for rows.Next() {
+		var item ListTableColumnsInSchemaRow
+		if err := rows.Scan(&item.ColumnName, &item.DataType, &item.ColumnDefault, &item.IsNullable, &item.TableName); err != nil {
+			return nil, fmt.Errorf("scan ListTableColumnsInSchemaBatch row: %w", err)
+		}
+		items = append(items, item)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("close ListTableColumnsInSchemaBatch rows: %w", err)
 	}
 	return items, err
 }

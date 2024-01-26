@@ -1,0 +1,23 @@
+schema_config:
+  public:
+    default_primary_key_name: id
+    skip_tables:
+      - migrations
+    table_config:
+      person:
+        proto_name: v1.Person
+        generate_field_mask_update: true
+      vehicle:
+        proto_name: v1.Vehicle
+        generate_field_mask_update: true
+      model:
+        proto_name: v1.Model
+        primary_key: id
+      manufacturer:
+        proto_name: v1.Manufacturer
+      rental:
+        proto_name: v1.Rental
+        generate_field_mask_update: true
+      ownership:
+        proto_name: v1.Ownership
+        generate_field_mask_update: true

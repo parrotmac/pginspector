@@ -1,7 +1,9 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"flag"
 	"fmt"
 	"io"
 	"log"
@@ -10,11 +12,85 @@ import (
 	"syscall"
 	"text/template"
 
+	"github.com/iancoleman/strcase"
 	"github.com/jackc/pgx/v4/pgxpool"
 	"github.com/parrotmac/pginspector/models"
-	"golang.org/x/text/cases"
-	"golang.org/x/text/language"
+	"github.com/pkg/errors"
+	"gopkg.in/yaml.v3"
 )
+
+type TableConfig struct {
+	ProtoName               string `yaml:"proto_name"`
+	PrimaryKey              string `yaml:"primary_key"`
+	GenerateFieldMaskUpdate bool   `yaml:"generate_field_mask_update"`
+}
+
+type SchemaConfig struct {
+	TableConfig             map[string]TableConfig `yaml:"table_config"`
+	DefaultPrimaryKeyColumn string                 `yaml:"default_primary_key_name"`
+	SkipTables              []string               `yaml:"skip_tables"`
+}
+
+func (s *SchemaConfig) ShouldSkipTable(tableName string) bool {
+	for _, t := range s.SkipTables {
+		if t == tableName {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *SchemaConfig) GetTableConfig(tableName string) TableConfig {
+	if s.TableConfig != nil {
+		if cfg, ok := s.TableConfig[tableName]; ok {
+			return cfg
+		}
+	}
+	return TableConfig{
+		ProtoName:               "",
+		PrimaryKey:              s.DefaultPrimaryKeyColumn,
+		GenerateFieldMaskUpdate: false,
+	}
+}
+
+type GeneratorConfiguration struct {
+	SchemaConfig map[string]SchemaConfig `yaml:"schema_config"`
+}
+
+const exampleConfig = `
+schema_config:
+  public:
+    default_primary_key_name: id
+    skip_tables:
+      - migrations
+    table_config:
+      person:
+        proto_name: v1.Person
+        generate_field_mask_update: true
+      vehicle:
+        proto_name: v1.Vehicle
+        generate_field_mask_update: true
+      model:
+        proto_name: v1.Model
+        primary_key: id
+      manufacturer:
+        proto_name: v1.Manufacturer
+      rental:
+        proto_name: v1.Rental
+        generate_field_mask_update: true
+      ownership:
+        proto_name: v1.Ownership
+        generate_field_mask_update: true
+`
+
+func ReadConfig(reader io.Reader) (GeneratorConfiguration, error) {
+	cfg := GeneratorConfiguration{}
+	err := yaml.NewDecoder(reader).Decode(&cfg)
+	if err != nil {
+		return cfg, errors.WithMessage(err, "Unable to parse config file")
+	}
+	return cfg, nil
+}
 
 type Relation struct {
 	Forward bool
@@ -31,11 +107,14 @@ type Column struct {
 }
 
 type Table struct {
-	Schema       string
-	Name         string
-	Columns      []Column
-	ProtoName    string
-	PKColumnName string
+	Schema  string
+	Name    string
+	Columns []Column
+}
+
+type GenerationTable struct {
+	Table
+	Config TableConfig
 }
 
 func (t *Table) PrettyPrint() {
@@ -60,10 +139,9 @@ func Unwrap[T any](p *T) T {
 func (s *Schema) ProcessRow(schemaName string, tableName string, col Column) {
 	if _, ok := s.Tables[tableName]; !ok {
 		s.Tables[tableName] = Table{
-			Schema:       schemaName,
-			Name:         tableName,
-			Columns:      []Column{},
-			PKColumnName: "id",
+			Schema:  schemaName,
+			Name:    tableName,
+			Columns: []Column{},
 		}
 	}
 
@@ -72,140 +150,111 @@ func (s *Schema) ProcessRow(schemaName string, tableName string, col Column) {
 	s.Tables[tableName] = t
 }
 
+var (
+	flagDatabaseURL = flag.String("database-url", os.Getenv("DATABASE_URL"), "Database URL to connect to")
+	flagConfigPath  = flag.String("config", "pginspector.yaml", "Path to config file")
+	flagOutputPath  = flag.String("output", "generated.sql", "Path to output file")
+)
+
 func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	dbURL := os.Getenv("DATABASE_URL")
-	if dbURL == "" {
-		dbURL = "postgres://postgres:postgres@localhost:54322/postgres?sslmode=disable"
-	}
+	flag.Parse()
 
-	sch, err := inspectTablesInSchema(ctx, "public", dbURL)
+	databaseURL := *flagDatabaseURL
+	configPath := *flagConfigPath
+	outputPath := *flagOutputPath
+
+	if databaseURL == "" {
+		log.Fatalf("-database-url (or DATABASE_URL environment variable) must be set (no default assumed)")
+	}
+	if configPath == "" {
+		log.Fatalf("-config must not be empty if set (defaults to pginspector.yaml when not set)")
+	}
+	if outputPath == "" {
+		log.Fatalf("-output must not be empty if set (defaults to generated.sql when not set)")
+	}
+	cfgReader, err := os.Open(configPath)
 	if err != nil {
-		log.Fatal(err)
+		log.Fatalf("Unable to open config file: %v\n", err)
 	}
-
-	tableProtoMap := map[string]string{
-		"person":       "v1.Person",
-		"vehicle":      "v1.Vehcile",
-		"model":        "v1.Model",
-		"manufacturer": "v1.Manufacturer",
-		"rental":       "v1.Rental",
-		"ownership":    "v1.Ownership",
-	}
-
-	allTables := []Table{}
-	for _, t := range sch.Tables {
-		t.ProtoName, _ = tableProtoMap[t.Name]
-		allTables = append(allTables, t)
-	}
-
-	err = os.MkdirAll("validation", 0755)
+	cfg, err := ReadConfig(cfgReader)
 	if err != nil {
-		log.Fatalf("Unable to create validation directory: %v\n", err)
+		log.Fatalf("Unable to read config file: %v\n", err)
 	}
 
-	outputFile, err := os.Create("validation/generated_queries.sql")
+	outputBuffer := bytes.NewBuffer([]byte{})
+
+	err = generate(ctx, databaseURL, cfg, outputBuffer)
 	if err != nil {
-		log.Fatalf("Unable to create output file: %v\n", err)
+		log.Fatalf("Unable to generate SQL: %v\n", err)
 	}
 
-	fmt.Fprintf(outputFile, "-- This file is generated by pginspector. DO NOT EDIT.\n\n")
-
-	err = generateGetAndListQueries(ctx, outputFile, allTables)
-	if err != nil {
-		log.Fatalf("Unable to generate get and list queries: %v\n", err)
-	}
-
-	err = generateUpdateQueries(ctx, outputFile, allTables)
-	if err != nil {
-		log.Fatalf("Unable to generate update queries: %v\n", err)
+	if outputPath == "-" {
+		_, err = io.Copy(os.Stdout, outputBuffer)
+		if err != nil {
+			log.Fatalf("Unable to write output to stdout: %v\n", err)
+		}
+	} else {
+		err = os.WriteFile(outputPath, outputBuffer.Bytes(), 0644)
+		if err != nil {
+			log.Fatalf("Unable to write output to file: %v\n", err)
+		}
 	}
 }
 
-func generateGetAndListQueries(ctx context.Context, w io.WriteCloser, tables []Table) error {
-	tmpl, err := template.New("SQLGetAndListQueries").Funcs(template.FuncMap{
-		"TitleCase": cases.Title(language.English).String,
-	}).Parse(`{{- define "SQLGetAndListQueries" -}}
-{{- range . }}
+func generate(ctx context.Context, databaseURL string, cfg GeneratorConfiguration, outputBuffer io.Writer) error {
 
--- name: Select{{ TitleCase .Name }}ByID :one {{- if .ProtoName }} proto-type={{ .ProtoName }} {{- end }}
-SELECT
-	{{- range $index, $col := .Columns }}
-	{{- if $index}},{{ end }}
-	{{ $col.Name }}
-	{{- end }}
-FROM {{ .Schema }}.{{ .Name }}
-WHERE {{ .PKColumnName }} = pggen.arg('{{ .PKColumnName }}');
-
--- name: Select{{ TitleCase .Name }}List :many {{- if .ProtoName }} proto-type={{ .ProtoName }} {{- end }}
-SELECT
-	{{- range $index, $col := .Columns }}
-	{{- if $index}},{{ end }}
-	{{ $col.Name }}
-	{{- end }}
-FROM {{ .Schema }}.{{ .Name }};
-
-{{- end }}
-{{- end }}
-`)
+	_, err := fmt.Fprintf(outputBuffer, "-- File generated by pginspector. DO NOT EDIT.\n\n")
 	if err != nil {
-		return err
+		return errors.WithMessage(err, "Unable to write output to file")
 	}
 
-	return tmpl.Execute(w, tables)
-}
+	for schemaName, schemaConfig := range cfg.SchemaConfig {
+		inspectedSchema, err := inspectTablesInSchema(ctx, databaseURL, schemaName, schemaConfig.SkipTables)
+		if err != nil {
+			return errors.WithMessage(err, "Unable to inspect schema")
+		}
+		tableConfigs := make([]GenerationTable, 0, len(schemaConfig.TableConfig))
+		for tableName, tableConfig := range schemaConfig.TableConfig {
+			if schemaConfig.ShouldSkipTable(tableName) {
+				continue
+			}
+			inspectedTable, ok := inspectedSchema.Tables[tableName]
+			if !ok {
+				return errors.Errorf("Unable to find table %s.%s\n", schemaName, tableName)
+			}
+			if tableConfig.PrimaryKey == "" {
+				tableConfig.PrimaryKey = schemaConfig.DefaultPrimaryKeyColumn
+			}
+			if tableConfig.PrimaryKey == "" {
+				return errors.Errorf("No primary key specified for table %s.%s and no default primary key set\n", schemaName, tableName)
+			}
+			tableConfigs = append(tableConfigs, GenerationTable{
+				Table:  inspectedTable,
+				Config: tableConfig,
+			})
+		}
 
-func generateUpdateQueries(ctx context.Context, w io.WriteCloser, tables []Table) error {
-	tmpl, err := template.New("SQLUpdateQueries").Funcs(template.FuncMap{
-		"TitleCase": cases.Title(language.English).String,
-	}).Parse(`{{- define "SQLUpdateQueries" -}}
-{{- range . }}
+		err = generateGetAndListQueries(ctx, outputBuffer, tableConfigs)
+		if err != nil {
+			return errors.WithMessage(err, "Unable to generate get and list queries")
+		}
 
--- name: Update{{ TitleCase .Name }} :one {{- if .ProtoName }} proto-type={{ .ProtoName }} {{- end }}
-UPDATE {{ .Schema }}.{{ .Name }}
-SET (
-{{- range $index, $col := .Columns }}
-	{{- if $index}},{{ end }}
-	{{ $col.Name }}
-	{{- end }}
-) = (
-{{- range $index, $col := .Columns }}
-	{{- if $index}},{{ end }}
-	pggen.arg('{{ $col.Name }}')
-	{{- end }}
-) WHERE {{ .PKColumnName }} = pggen.arg('{{ .PKColumnName }}') RETURNING *;
-
--- name: Update{{ TitleCase .Name }}FieldMask :one {{- if .ProtoName }} proto-type={{ .ProtoName }} {{- end }}
-UPDATE {{ .Schema }}.{{ .Name }}
-SET (
-{{- range $index, $col := .Columns }}
-	{{- if $index}},{{ end }}
-	{{ $col.Name }}
-	{{- end }}
-) = (
-{{- range $index, $col := .Columns }}
-	{{- if $index}},{{ end }}
-	CASE
-		WHEN '{{ $col.Name }}' = ANY(pggen.arg('_field_mask')::text[]) THEN pggen.arg('{{ $col.Name }}')
-		ELSE {{ $col.Name }}
-	END
-	{{- end }}
-) WHERE {{ .PKColumnName }} = pggen.arg('{{ .PKColumnName }}') RETURNING *;
-
-{{- end }}
-{{- end }}`)
-	if err != nil {
-		return err
+		err = generateUpdateQueries(ctx, outputBuffer, tableConfigs)
+		if err != nil {
+			return errors.WithMessage(err, "Unable to generate update queries")
+		}
 	}
-	return tmpl.Execute(w, tables)
+
+	return nil
 }
 
-func inspectTablesInSchema(ctx context.Context, name string, dbConnectionString string) (Schema, error) {
+func inspectTablesInSchema(ctx context.Context, dbConnectionString string, schemaName string, excludedTableNames []string) (Schema, error) {
 	pgxConfig, err := pgxpool.ParseConfig(dbConnectionString)
 	if err != nil {
-		log.Fatalf("Unable to parse DATABASE_URL: %v\n", err)
+		log.Fatalf("Unable to parse database connection string: %v\n", err)
 	}
 	pool, err := pgxpool.ConnectConfig(ctx, pgxConfig)
 	if err != nil {
@@ -214,7 +263,7 @@ func inspectTablesInSchema(ctx context.Context, name string, dbConnectionString 
 
 	querier := models.NewQuerier(pool)
 
-	tablesAndColumns, err := querier.ListTableColumnsInSchema(ctx, "public")
+	tablesAndColumns, err := querier.ListTableColumnsInSchema(ctx, schemaName, excludedTableNames)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -224,7 +273,7 @@ func inspectTablesInSchema(ctx context.Context, name string, dbConnectionString 
 	}
 
 	for _, col := range tablesAndColumns {
-		sch.ProcessRow("public", col.TableName, Column{
+		sch.ProcessRow(schemaName, col.TableName, Column{
 			Name:     col.ColumnName,
 			PGType:   Unwrap(col.DataType),
 			Nullable: Unwrap(col.IsNullable) == "YES",
@@ -232,9 +281,84 @@ func inspectTablesInSchema(ctx context.Context, name string, dbConnectionString 
 		})
 	}
 
-	for _, t := range sch.Tables {
-		t.PrettyPrint()
-	}
-
 	return sch, nil
+}
+
+func generateGetAndListQueries(ctx context.Context, w io.Writer, tables []GenerationTable) error {
+	tmpl, err := template.New("SQLGetAndListQueries").Funcs(template.FuncMap{
+		"ToCamel": strcase.ToCamel,
+	}).Parse(`{{- define "SQLGetAndListQueries" -}}
+{{- range . }}
+
+-- name: Select{{ ToCamel .Name }}ByID :one {{- if .Config.ProtoName }} proto-type={{ .Config.ProtoName }} {{- end }}
+SELECT
+        {{- range $index, $col := .Columns }}
+        {{- if $index}},{{ end }}
+        {{ $col.Name }}
+        {{- end }}
+FROM {{ .Schema }}.{{ .Name }}
+WHERE {{ .Config.PrimaryKey }} = pggen.arg('{{ .Config.PrimaryKey }}');
+
+-- name: Select{{ ToCamel .Name }}List :many {{- if .Config.ProtoName }} proto-type={{ .Config.ProtoName }} {{- end }}
+SELECT
+        {{- range $index, $col := .Columns }}
+        {{- if $index}},{{ end }}
+        {{ $col.Name }}
+        {{- end }}
+FROM {{ .Schema }}.{{ .Name }};
+
+{{- end }}
+{{- end }}
+`)
+	if err != nil {
+		return err
+	}
+	return tmpl.Execute(w, tables)
+}
+
+func generateUpdateQueries(ctx context.Context, w io.Writer, tables []GenerationTable) error {
+	tmpl, err := template.New("SQLUpdateQueries").Funcs(template.FuncMap{
+		"ToCamel": strcase.ToCamel,
+	}).Parse(`{{- define "SQLUpdateQueries" -}}
+{{- range . }}
+
+-- name: Update{{ ToCamel .Name }} :one {{- if .Config.ProtoName }} proto-type={{ .Config.ProtoName }} {{- end }}
+UPDATE {{ .Schema }}.{{ .Name }}
+SET (
+{{- range $index, $col := .Columns }}
+        {{- if $index}},{{ end }}
+        {{ $col.Name }}
+        {{- end }}
+) = (
+{{- range $index, $col := .Columns }}
+        {{- if $index}},{{ end }}
+        pggen.arg('{{ $col.Name }}')
+        {{- end }}
+) WHERE {{ .Config.PrimaryKey }} = pggen.arg('{{ .Config.PrimaryKey }}') RETURNING *;
+
+{{- if .Config.GenerateFieldMaskUpdate }}
+-- name: Update{{ ToCamel .Name }}FieldMask :one {{- if .Config.ProtoName }} proto-type={{ .Config.ProtoName }} {{- end }}
+UPDATE {{ .Schema }}.{{ .Name }}
+SET (
+{{- range $index, $col := .Columns }}
+        {{- if $index}},{{ end }}
+        {{ $col.Name }}
+        {{- end }}
+) = (
+{{- range $index, $col := .Columns }}
+        {{- if $index}},{{ end }}
+        CASE
+        	WHEN '{{ $col.Name }}' = ANY(pggen.arg('_field_mask')::text[]) THEN pggen.arg('{{ $col.Name }}')
+        	ELSE {{ $col.Name }}
+        END
+        {{- end }}
+) WHERE {{ .Config.PrimaryKey }} = pggen.arg('{{ .Config.PrimaryKey }}') RETURNING *;
+{{- end }}
+
+{{- end }}
+{{- end }}`)
+	if err != nil {
+		return err
+	}
+	return tmpl.Execute(w, tables)
 }
