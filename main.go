@@ -10,6 +10,7 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"sort"
 	"syscall"
 	"text/template"
 
@@ -272,13 +273,30 @@ func generate(ctx context.Context, databaseURL string, cfg GeneratorConfiguratio
 		return errors.WithMessage(err, "Unable to write output to file")
 	}
 
-	for schemaName, schemaConfig := range cfg.SchemaConfig {
+	sortedSchemaNames := make([]string, 0, len(cfg.SchemaConfig))
+	for schemaName := range cfg.SchemaConfig {
+		sortedSchemaNames = append(sortedSchemaNames, schemaName)
+	}
+	sort.Strings(sortedSchemaNames)
+
+	for _, schemaName := range sortedSchemaNames {
+		schemaConfig := cfg.SchemaConfig[schemaName]
+
 		inspectedSchema, err := inspectTablesInSchema(ctx, databaseURL, schemaName, schemaConfig.SkipTables, debug)
 		if err != nil {
 			return errors.WithMessage(err, "Unable to inspect schema")
 		}
 		tableConfigs := make([]GenerationTable, 0, len(schemaConfig.TableConfig))
-		for tableName, tableConfig := range schemaConfig.TableConfig {
+
+		sortedTableNames := make([]string, 0, len(inspectedSchema.Tables))
+		for tableName := range inspectedSchema.Tables {
+			sortedTableNames = append(sortedTableNames, tableName)
+		}
+		sort.Strings(sortedTableNames)
+
+		for _, tableName := range sortedTableNames {
+			tableConfig := schemaConfig.GetTableConfig(tableName)
+
 			if schemaConfig.ShouldSkipTable(tableName) {
 				continue
 			}
